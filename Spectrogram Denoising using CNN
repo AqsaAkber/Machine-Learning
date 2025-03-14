@@ -1,0 +1,580 @@
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import matplotlib.pyplot as plt
+import time
+import os
+from typing import Tuple, List, Dict
+from F_infi_2 import *  # Import signal generation functions
+
+from torchvision.models import resnet101
+
+class SignalDataset(Dataset):
+    def __init__(self, size: int, spectrogram_size: Tuple[int, int] = (129, 256), window_size: int = 5, device: torch.device = torch.device("cpu")):
+        self.size = size
+        self.modulators = [Linear, Exponential, InverseExponential,
+                           Sinusoidal, LinearChirp, ExponentialChirp]
+        self.noise_funcs = [whitenoise, pinknoise, brownoise]
+        self.spectrogram_size = spectrogram_size
+        self.window_size = window_size
+        self.device = device
+
+    def __len__(self):
+        return self.size
+
+    # ✅ Move inside the class
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        params = get_signal_params()
+        signal_type = np.random.choice(['am_fm', 'chirp', 'trumpet_chirp'])
+
+        if signal_type == 'am_fm':
+            am_mod_class = np.random.choice(self.modulators)
+            fm_mod_class = np.random.choice(self.modulators)
+
+            am_modulator = am_mod_class(params['am_ymin'], params['am_ymax'],
+                                        np.random.uniform(params['am_fmin'], params['am_fmax'])) if am_mod_class == Sinusoidal else am_mod_class(params['am_ymin'], params['am_ymax'])
+            fm_modulator = fm_mod_class(params['fm_fmin'], params['fm_fmax'],
+                                        np.random.uniform(params['fm_fmin'], params['fm_fmax'])) if fm_mod_class == Sinusoidal else fm_mod_class(params['fm_fmin'], params['fm_fmax'])
+
+            signal, _, _ = generate_modulated_signal(
+                params, am_modulator, fm_modulator)
+
+        elif signal_type == 'chirp':
+            fm_mod_class = np.random.choice([LinearChirp, ExponentialChirp])
+            fm_modulator = fm_mod_class(
+                f0=params['fm_cfmin'], f1=params['fm_cfmax'])
+
+            signal, _ = generate_chirp_signal(params, fm_modulator)
+
+        else:  # 'trumpet_chirp'
+            trumpet_chirp = TrumpetChirp(
+                f0=params['fm_cfmin'],
+                f1=params['fm_cfmax'],
+                exp_factor=params['exp_factor']
+            )
+            signal, _ = generate_trumpet_chirp_signal(params, trumpet_chirp)
+
+        noise_func = np.random.choice(self.noise_funcs)
+        noise = noise_func(params['N'], rmsnorm=True)
+
+        Sxx, Sxx_signal, _, _ = generate_spectrograms(
+            signal, noise, params['Fs'])
+        Sxx = self.pad_or_crop_spectrogram(Sxx)
+        Sxx_signal = self.pad_or_crop_spectrogram(Sxx_signal)
+
+        noisy_context = self.extract_context(Sxx)
+        clean_context = self.extract_context(Sxx_signal)
+
+        noisy_flat = (noisy_context - np.min(noisy_context)) / \
+            (np.max(noisy_context) - np.min(noisy_context))
+        clean_flat = (clean_context - np.min(clean_context)) / \
+            (np.max(clean_context) - np.min(clean_context))
+
+        noisy_flat = np.transpose(noisy_flat, (2, 0, 1))
+        clean_flat = np.transpose(clean_flat, (2, 0, 1))
+
+        return {
+            'clean_spectrogram': torch.FloatTensor(clean_flat).to(self.device),
+            'noisy_spectrogram': torch.FloatTensor(noisy_flat).to(self.device),
+            'signal_type': signal_type  # ✅ Ensure this is included
+        }
+
+    def extract_context(self, Sxx: np.ndarray) -> np.ndarray:
+        window = self.window_size
+        padded_Sxx = np.pad(
+            Sxx, ((0, 0), (window // 2, window // 2)), mode='constant')
+        context_frames = []
+        for i in range(Sxx.shape[1]):
+            context_frames.append(padded_Sxx[:, i:i + window])
+        return np.stack(context_frames, axis=1)
+
+    def pad_or_crop_spectrogram(self, Sxx: np.ndarray) -> np.ndarray:
+        target_height, target_width = self.spectrogram_size
+        current_height, current_width = Sxx.shape
+        if current_height < target_height:
+            Sxx = np.pad(
+                Sxx, ((0, target_height - current_height), (0, 0)), mode='constant')
+        elif current_height > target_height:
+            Sxx = Sxx[:target_height, :]
+        if current_width < target_width:
+            Sxx = np.pad(
+                Sxx, ((0, 0), (0, target_width - current_width)), mode='constant')
+        elif current_width > target_width:
+            Sxx = Sxx[:, :target_width]
+        return Sxx
+
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation Block for Attention"""
+    def __init__(self, in_channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.fc1 = nn.Linear(in_channels, in_channels // reduction)
+        self.fc2 = nn.Linear(in_channels // reduction, in_channels)
+
+    def forward(self, x):
+        batch, channels, _, _ = x.size()
+        squeeze = x.view(batch, channels, -1).mean(dim=2)
+        excitation = F.relu(self.fc1(squeeze))
+        excitation = torch.sigmoid(self.fc2(excitation)).view(batch, channels, 1, 1)
+        return x * excitation
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet101
+
+class UNetResNet101(nn.Module):
+    def __init__(self):
+        super(UNetResNet101, self).__init__()
+        base_model = resnet101(pretrained=True)
+
+        # Modify first layer to accept 5 channels instead of 3
+        self.encoder1 = nn.Conv2d(5, 64, kernel_size=7, stride=2, padding=3, bias=False)  
+        self.encoder1.weight.data[:, :3] = base_model.conv1.weight  # Initialize with ResNet weights
+        self.encoder2 = base_model.layer1
+        self.encoder3 = base_model.layer2
+        self.encoder4 = base_model.layer3
+
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+
+        # Decoder (upsampling layers)
+        self.decoder4 = self.upconv(512, 256)
+        self.decoder3 = self.upconv(256, 128)
+        self.decoder2 = self.upconv(128, 64)
+        self.decoder1 = self.upconv(64, 5)
+
+        # Skip connections (align shapes)
+        self.skip1 = nn.Conv2d(64, 64, kernel_size=1)
+        self.skip2 = nn.Conv2d(256, 128, kernel_size=1)
+        self.skip3 = nn.Conv2d(512, 256, kernel_size=1)
+
+    def upconv(self, in_channels, out_channels):
+        """Upsampling + Conv to prevent size mismatch"""
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1), 
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        orig_size = x.shape[-2:]
+
+        # Encoding
+        x1 = self.encoder1(x)  # Output size: (batch, 64, H/2, W/2)
+        x2 = self.encoder2(x1) # (batch, 256, H/4, W/4)
+        x3 = self.encoder3(x2) # (batch, 512, H/8, W/8)
+        x4 = self.encoder4(x3) # (batch, 1024, H/16, W/16)
+
+        # Bottleneck
+        x_bottleneck = self.bottleneck(x4)
+
+        # Decoding (upsampling to match skip connections)
+        x = self.decoder4(x_bottleneck)  # (batch, 256, H/8, W/8)
+        x = F.interpolate(x, size=x3.shape[-2:], mode="bilinear", align_corners=True) + self.skip3(x3)  # Align size
+        
+        x = self.decoder3(x)  # (batch, 128, H/4, W/4)
+        x = F.interpolate(x, size=x2.shape[-2:], mode="bilinear", align_corners=True) + self.skip2(x2)  # Align size
+        
+        x = self.decoder2(x)  # (batch, 64, H/2, W/2)
+        x = F.interpolate(x, size=x1.shape[-2:], mode="bilinear", align_corners=True) + self.skip1(x1)  # Align size
+        
+        x = self.decoder1(x)  # (batch, 5, H, W)
+        x = F.interpolate(x, size=orig_size, mode="bilinear", align_corners=True)  # Final upsampling
+
+        return x
+
+
+def align_tensors(output: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """ Ensures output & target tensors match in height and width for proper reconstruction. """
+    
+    assert output.dim() == 4 and target.dim() == 4, "Both tensors must have shape (batch, channels, height, width)"
+    
+    output_height, output_width = output.shape[2], output.shape[3]
+    target_height, target_width = target.shape[2], target.shape[3]
+
+    # Adjust height
+    if output_height > target_height:
+        output = output[:, :, :target_height, :]
+    elif output_height < target_height:
+        pad_h = target_height - output_height
+        output = F.pad(output, (0, 0, pad_h // 2, pad_h - pad_h // 2))  # Symmetric padding
+
+    # Adjust width
+    if output_width > target_width:
+        output = output[:, :, :, :target_width]
+    elif output_width < target_width:
+        pad_w = target_width - output_width
+        output = F.pad(output, (pad_w // 2, pad_w - pad_w // 2, 0, 0))  # Symmetric padding
+
+    return output, target
+
+def modified_mse(output: torch.Tensor, target: torch.Tensor, p: float = 1.0) -> torch.Tensor:
+    output_mag = torch.abs(output) ** p
+    target_mag = torch.abs(target) ** p
+    loss = torch.mean((output_mag - target_mag) ** 2)
+    return loss
+
+#def log_mse_loss(output, target, epsilon=1e-8):
+#    return torch.mean((torch.log10(output + epsilon) - torch.log10(target + epsilon)) ** 2)
+
+def calculate_full_validation_loss(model: nn.Module, val_loader: DataLoader, criterion, device: torch.device):
+    model.eval()
+    total_loss, total_count = 0.0, 0
+    total_loss_amfm, total_loss_chirp, total_loss_trumpet = 0.0, 0.0, 0.0
+    total_count_amfm, total_count_chirp, total_count_trumpet = 0, 0, 0
+
+    with torch.no_grad():
+        for batch in val_loader:
+            noisy_spectrogram = batch['noisy_spectrogram'].to(device)
+            clean_spectrogram = batch['clean_spectrogram'].to(device)
+            outputs = model(noisy_spectrogram)
+            outputs, clean_spectrogram = align_tensors(
+                outputs, clean_spectrogram)
+            val_loss = criterion(outputs, clean_spectrogram)
+
+            total_loss += val_loss.item()
+            total_count += 1
+
+            if batch['signal_type'][0] == 'am_fm':
+                total_loss_amfm += val_loss.item()
+                total_count_amfm += 1
+            elif batch['signal_type'][0] == 'chirp':
+                total_loss_chirp += val_loss.item()
+                total_count_chirp += 1
+            elif batch['signal_type'][0] == 'trumpet_chirp':
+                total_loss_trumpet += val_loss.item()
+                total_count_trumpet += 1
+
+    avg_loss = total_loss / max(total_count, 1)
+    avg_loss_amfm = total_loss_amfm / \
+        max(total_count_amfm, 1) if total_count_amfm > 0 else 0.0
+    avg_loss_chirp = total_loss_chirp / \
+        max(total_count_chirp, 1) if total_count_chirp > 0 else 0.0
+    avg_loss_trumpet = total_loss_trumpet / \
+        max(total_count_trumpet, 1) if total_count_trumpet > 0 else 0.0
+
+    print(
+        f"Validation Loss - Overall: {avg_loss:.6f}, AM/FM: {avg_loss_amfm:.6f}, Chirp: {avg_loss_chirp:.6f}, Trumpet Chirp: {avg_loss_trumpet:.6f}")
+
+    model.train()
+    # ✅ Always return 4 values
+    return avg_loss, avg_loss_amfm, avg_loss_chirp, avg_loss_trumpet
+
+
+def plot_spectrograms(clean_spectrogram: np.ndarray, noisy_spectrogram: np.ndarray, reconstructed_spectrogram: np.ndarray, save_dir: str) -> None:
+    def ensure_2d(spectrogram, name):
+        if len(spectrogram.shape) == 3:  # If 3D: [window_size, height, width]
+            return np.mean(spectrogram, axis=0)
+        elif len(spectrogram.shape) == 2:  # Already 2D
+            return spectrogram
+        else:
+            print(
+                f"Warning: Unexpected shape {spectrogram.shape} for {name}. Skipping.")
+            return None
+
+    # Ensure all spectrograms are 2D
+    clean_spectrogram = ensure_2d(clean_spectrogram, "clean_spectrogram")
+    noisy_spectrogram = ensure_2d(noisy_spectrogram, "noisy_spectrogram")
+    reconstructed_spectrogram = ensure_2d(
+        reconstructed_spectrogram, "reconstructed_spectrogram")
+
+    # Skip plotting if any spectrogram is invalid
+    if clean_spectrogram is None or noisy_spectrogram is None or reconstructed_spectrogram is None:
+        print("Skipping spectrogram plotting due to invalid dimensions.")
+        return
+
+    # ✅ Normalize the reconstructed spectrogram using Min-Max Scaling
+    reconstructed_spectrogram = (reconstructed_spectrogram - np.min(reconstructed_spectrogram)) / (
+        np.max(reconstructed_spectrogram) - np.min(reconstructed_spectrogram) + 1e-8)
+
+    # Clip values before log scaling to avoid log(0)
+    #clean_spectrogram = np.clip(clean_spectrogram, 1e-8, None)
+    #noisy_spectrogram = np.clip(noisy_spectrogram, 1e-8, None)
+    #reconstructed_spectrogram = np.clip(reconstructed_spectrogram, 1e-8, None)
+    
+    # ✅ Ensure all values are positive before log scaling
+    clean_spectrogram = np.maximum(clean_spectrogram, 1e-8)
+    noisy_spectrogram = np.maximum(noisy_spectrogram, 1e-8)
+    reconstructed_spectrogram = np.maximum(reconstructed_spectrogram, 1e-8)
+
+    # ✅ Convert to dB for better visualization
+    clean_db = 10 * np.log10(clean_spectrogram)
+    noisy_db = 10 * np.log10(noisy_spectrogram)
+    reconstructed_db = 10 * np.log10(reconstructed_spectrogram)
+
+    # ✅ Use separate vmin/vmax for each spectrogram
+    vmin_clean, vmax_clean = np.percentile(clean_db, [1, 99])
+    vmin_noisy, vmax_noisy = np.percentile(noisy_db, [1, 99])
+    vmin_reconstructed, vmax_reconstructed = np.percentile(
+        reconstructed_db, [1, 99])
+
+    # Plotting
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    im0 = axes[0].imshow(clean_db, aspect='auto', origin='lower',
+                         cmap='viridis', vmin=vmin_clean, vmax=vmax_clean)
+    axes[0].set_title("Clean Spectrogram")
+    axes[0].set_xlabel('Time (Frames)')
+    axes[0].set_ylabel('Frequency (Hz)')
+    fig.colorbar(im0, ax=axes[0])
+
+    im1 = axes[1].imshow(noisy_db, aspect='auto', origin='lower',
+                         cmap='viridis', vmin=vmin_noisy, vmax=vmax_noisy)
+    axes[1].set_title("Noisy Spectrogram")
+    axes[1].set_xlabel('Time (Frames)')
+    axes[1].set_ylabel('Frequency (Hz)')
+    fig.colorbar(im1, ax=axes[1])
+
+    im2 = axes[2].imshow(reconstructed_db, aspect='auto', origin='lower',
+                         cmap='viridis', vmin=vmin_reconstructed, vmax=vmax_reconstructed)
+    axes[2].set_title("Reconstructed Spectrogram")
+    axes[2].set_xlabel('Time (Frames)')
+    axes[2].set_ylabel('Frequency (Hz)')
+    fig.colorbar(im2, ax=axes[2])
+
+    plt.tight_layout()
+
+    # Save the figure
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    plot_path = os.path.join(save_dir, f"spectrogram_14_{timestamp}.png")
+    plt.savefig(plot_path, dpi=300)
+    print(f"Spectrogram comparison saved to {plot_path}")
+    plt.close()
+
+
+def plot_loss(train_losses: List[float], val_losses: List[float], batch_signals: List[int], save_dir: str) -> None:
+    os.makedirs(save_dir, exist_ok=True)  # Ensure directory exists
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(batch_signals, train_losses, label='Training Loss')
+
+    if len(batch_signals) >= len(val_losses) and len(val_losses) > 0:
+        plt.plot(batch_signals[::max(
+            1, len(batch_signals) // len(val_losses))], val_losses, label='Validation Loss')
+    else:
+        plt.plot(batch_signals, val_losses, label='Validation Loss')
+
+    plt.xlabel('Batch of Signals')
+    plt.ylabel('MSE Loss')
+    plt.title('Training and Validation Loss Over Batches')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    loss_plot_path = os.path.join(save_dir, f'loss_plot_14_{timestamp}.png')
+
+    try:
+        plt.savefig(loss_plot_path, dpi=300)
+        print(f"✅ Loss plot saved to '{loss_plot_path}'")
+    except Exception as e:
+        print(f"❌ Error saving loss plot: {e}")
+
+    plt.close()
+
+
+def train_model():
+    cnn_logs_dir = 'CNN_logs'
+    cnn_spectrogram_dir = 'CNN_spectrograms'
+    os.makedirs(cnn_logs_dir, exist_ok=True)
+    os.makedirs(cnn_spectrogram_dir, exist_ok=True)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(cnn_logs_dir, f'training_log_14_{timestamp}.py')
+
+    with open(log_path, 'w') as log_file:
+        log_file.write("Training Log\n")
+        log_file.write("=" * 40 + "\n")
+        log_file.write(
+            "Batch Number | Train Loss (AM/FM) | Train Loss (Chirp) | Train Loss (Trumpet) | "
+            "Val Loss (AM/FM) | Val Loss (Chirp) | Val Loss (Trumpet) | Noisy SNR | Denoised SNR\n"
+        )
+        log_file.write("-" * 150 + "\n")
+
+    current_path = os.getcwd()
+    model_save_path = os.path.join(
+        current_path, f'CNN_Denoiser_model_14_{timestamp}.pth'
+    )
+
+    spect_size = (129, 256)
+    batch_size = 20
+    learning_rate = 0.001
+    early_stopping_patience = 5
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset = SignalDataset(
+        size=100, spectrogram_size=spect_size, device=device)
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.2 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, [train_size, val_size, test_size])
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
+
+    # Training code with MSE loss
+    model = UNetResNet101().to(device)
+    #model = DenoisingAutoencoder().to(device)
+    #criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    def criterion(output, target):
+        return modified_mse(output, target)
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    train_losses, val_losses, batch_signals = [], [], []
+    best_val_loss, patience = float('inf'), 0
+    batch_count = 0  # Track batch number
+
+    def compute_avg_snr(model, val_loader, device):
+        model.eval()
+        total_noisy_snr, total_denoised_snr, count = 0.0, 0.0, 0
+        with torch.no_grad():
+            for batch in val_loader:
+                noisy_spectrogram = batch['noisy_spectrogram'].to(device)
+                clean_spectrogram = batch['clean_spectrogram'].to(device)
+                outputs = model(noisy_spectrogram)
+                outputs, clean_spectrogram = align_tensors(outputs, clean_spectrogram)
+    
+                noisy_np = noisy_spectrogram.cpu().numpy()
+                clean_np = clean_spectrogram.cpu().numpy()
+                denoised_np = outputs.cpu().numpy()
+    
+                noise_noisy = clean_np - noisy_np
+                signal_power = np.mean(np.abs(clean_np) ** 2)  # Ensure clean spectrogram is non-negative
+                noise_power_noisy = np.mean(noise_noisy ** 2)
+                noise_power_noisy = max(noise_power_noisy, 1e-8)  # Avoid small noise power
+    
+                noisy_snr = 10 * np.log10(signal_power / (noise_power_noisy + 1e-8))
+    
+                noise_denoised = clean_np - denoised_np
+                noise_power_denoised = np.mean(noise_denoised ** 2)
+                noise_power_denoised = max(noise_power_denoised, 1e-8)  # Same for denoised SNR
+                denoised_snr = 10 * np.log10(signal_power / (noise_power_denoised + 1e-8))
+    
+                total_noisy_snr += noisy_snr
+                total_denoised_snr += denoised_snr
+                count += 1
+    
+        avg_noisy_snr = total_noisy_snr / max(count, 1)
+        avg_denoised_snr = total_denoised_snr / max(count, 1)
+        return avg_noisy_snr, avg_denoised_snr
+
+
+    while True:
+        model.train()
+        running_train_loss = 0.0
+        num_batches = 0
+        train_loss_amfm, train_loss_chirp, train_loss_trumpet = 0.0, 0.0, 0.0
+        count_amfm, count_chirp, count_trumpet = 0, 0, 0
+
+        for batch in train_loader:
+            if 'signal_type' not in batch:
+                raise KeyError(
+                    "❌ Error: 'signal_type' is missing from batch. Check Dataset `__getitem__`.")
+
+            noisy_spectrogram = batch['noisy_spectrogram'].to(device)
+            clean_spectrogram = batch['clean_spectrogram'].to(device)
+            outputs = model(noisy_spectrogram)
+            outputs, clean_spectrogram = align_tensors(
+                outputs, clean_spectrogram)
+            loss = criterion(outputs, clean_spectrogram)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_train_loss += loss.item()
+            num_batches += 1
+            batch_count += 1  # Increment batch count
+
+            if batch['signal_type'][0] == 'am_fm':
+                train_loss_amfm += loss.item()
+                count_amfm += 1
+            elif batch['signal_type'][0] == 'chirp':
+                train_loss_chirp += loss.item()
+                count_chirp += 1
+            elif batch['signal_type'][0] == 'trumpet_chirp':
+                train_loss_trumpet += loss.item()
+                count_trumpet += 1
+
+        avg_train_loss = running_train_loss / num_batches
+        avg_loss, avg_loss_amfm, avg_loss_chirp, avg_loss_trumpet = calculate_full_validation_loss(
+            model, val_loader, criterion, device)
+
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_loss)
+        batch_signals.append(batch_count)
+
+        avg_noisy_snr, avg_denoised_snr = compute_avg_snr(
+            model, val_loader, device)
+
+        # ✅ Write log every 10 batches to reduce I/O overhead
+        if batch_count % 10 == 0:
+            with open(log_path, 'a') as log_file:
+                log_file.write(
+                    f"{batch_count} | {train_loss_amfm:.6f} | {train_loss_chirp:.6f} | {train_loss_trumpet:.6f} | "
+                    f"{avg_loss_amfm:.6f} | {avg_loss_chirp:.6f} | {avg_loss_trumpet:.6f} | "
+                    f"{avg_noisy_snr:.3f} | {avg_denoised_snr:.3f}\n"
+                )
+
+        print(
+            f"Batch {batch_count} - Train Loss: {avg_train_loss:.6f} | Validation Loss: {avg_loss:.6f}")
+        print(
+            f"Batch {batch_count} - Noisy SNR = {avg_noisy_snr:.3f} dB | Denoised SNR = {avg_denoised_snr:.3f} dB")
+
+        if avg_loss < best_val_loss:
+            best_val_loss = avg_loss
+            patience = 0
+            # ✅ Save best model
+            torch.save(model, model_save_path)
+        else:
+            patience += 1
+
+        if patience >= early_stopping_patience:
+            print("Early stopping triggered.")
+            break
+    plot_loss(train_losses, val_losses, batch_signals, save_dir=cnn_spectrogram_dir)
+    # ======= Model Evaluation ========
+    model.eval()
+    with torch.no_grad():
+        for idx, batch in enumerate(test_loader):
+            if idx >= 5:
+                break
+            noisy_spectrogram = batch['noisy_spectrogram'].to(device)
+            clean_spectrogram = batch['clean_spectrogram'].to(device)
+            reconstructed_spectrogram = model(noisy_spectrogram)
+            reconstructed_spectrogram, clean_spectrogram = align_tensors(
+                reconstructed_spectrogram, clean_spectrogram)
+
+            reconstructed_spectrogram = np.clip(
+                reconstructed_spectrogram.cpu().numpy().squeeze(), 1e-8, None)
+
+            plot_spectrograms(
+                clean_spectrogram.cpu().numpy().squeeze(),
+                noisy_spectrogram.cpu().numpy().squeeze(),
+                reconstructed_spectrogram,
+                save_dir=cnn_spectrogram_dir
+            )
+
+    with open(log_path, 'a') as log_file:
+        log_file.write(
+            "Evaluation completed. Spectrogram comparisons saved.\n")
+
+    print("Evaluation completed. Spectrogram comparisons saved.")
+
+
+if __name__ == "__main__":
+    train_model()
